@@ -9,27 +9,23 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, precision_score, recall_score
 
-# ================= 配置区域 (Configuration) =================
-# [Resource Strategy] 基于 Task 0.4 测试结果优化
-BATCH_SIZE = 2048      # 你的 48GB 显存完全吃得消
-LR = 1e-3              # 初始学习率
-EPOCHS = 50            # 总轮次
-PATIENCE = 5           # 早停耐心值 (几轮不提升就停止)
-MAX_LABELS = 40000     # 尽可能覆盖全量标签
+# ================= HYPER 配置 (L20 48GB 专用) =================
+BATCH_SIZE = 4096      
+LR = 2e-3              
+EPOCHS = 50
+PATIENCE = 8           
+MAX_LABELS = 26125     
 
 PATHS = {
     'embeddings': './cache/esm2-650M_embeddings.pkl',
     'train_terms': 'data/Train/train_terms.tsv',
-    'model_save': './models/m2_esm2_best.pth',
+    'model_save': './models/m2_esm2_hyper.pth',
     'log_file': './models/training_log.csv'
 }
 os.makedirs('./models', exist_ok=True)
 
-# ================= 1. 组件定义 =================
-
-# [Source: Listing 11] IC加权 Loss - 核心竞争力来源
+# ================= 1. 核心组件 =================
 class ICWeightedBCELoss(nn.Module):
     def __init__(self, ic_weights, device='cuda'):
         super().__init__()
@@ -37,11 +33,9 @@ class ICWeightedBCELoss(nn.Module):
 
     def forward(self, logits, targets):
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        # 广播权重: [1, n_labels] * [batch, n_labels]
         weighted_bce = bce_loss * self.ic_weights.unsqueeze(0)
         return weighted_bce.mean()
 
-# [Source: Listing 11] 模型架构
 class ESM2Predictor(nn.Module):
     def __init__(self, n_labels, esm_embedding_dim=1280):
         super().__init__()
@@ -55,134 +49,138 @@ class ESM2Predictor(nn.Module):
     def forward(self, x):
         return self.head(x)
 
-class CachedEmbeddingDataset(Dataset):
-    def __init__(self, protein_ids, embeddings_dict, labels_dict, num_classes):
-        self.protein_ids = protein_ids
-        self.embeddings = embeddings_dict
-        self.labels = labels_dict
+class UltraFastDataset(Dataset):
+    def __init__(self, embedding_tensor, labels_list, num_classes):
+        self.embeddings = embedding_tensor 
+        self.labels = labels_list
         self.num_classes = num_classes
 
     def __len__(self):
-        return len(self.protein_ids)
+        return len(self.labels)
 
     def __getitem__(self, idx):
-        pid = self.protein_ids[idx]
-        emb = self.embeddings[pid]
-        label_indices = self.labels.get(pid, [])
+        emb = self.embeddings[idx]
+        label_indices = self.labels[idx]
         label_vec = torch.zeros(self.num_classes, dtype=torch.float32)
         if len(label_indices) > 0:
             label_vec[label_indices] = 1.0
         return emb, label_vec
 
-# ================= 2. 增强监控工具 =================
-def calculate_metrics(y_true, y_pred_logits, threshold=0.3):
+# ================= 2. [关键优化] GPU 加速指标计算 =================
+def calculate_metrics_gpu(y_true_tensor, y_logits_tensor):
     """
-    计算多维度健康指标
-    y_true: numpy array (N, Labels)
-    y_pred_logits: numpy array (N, Labels)
+    完全在 GPU 上计算 F1，消除 CPU 瓶颈。
+    同时扫描最佳阈值，解决"预测数量少"的问题。
     """
-    # Sigmoid 转概率
-    probs = 1 / (1 + np.exp(-y_pred_logits))
-    preds = (probs > threshold).astype(int)
+    probs = torch.sigmoid(y_logits_tensor)
     
-    # 1. Sample F1 (最接近 CAFA 评分)
-    sample_f1 = f1_score(y_true, preds, average='samples', zero_division=0)
+    best_f1 = 0.0
+    best_metrics = {}
     
-    # 2. Macro F1 (关注稀有类别表现)
-    macro_f1 = f1_score(y_true, preds, average='macro', zero_division=0)
+    # 扫描阈值 (模拟 CAFA 官方逻辑)
+    thresholds = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
     
-    # 3. Precision / Recall (查准 vs 查全)
-    precision = precision_score(y_true, preds, average='samples', zero_division=0)
-    recall = recall_score(y_true, preds, average='samples', zero_division=0)
-    
-    # 4. [关键监控] 正例率 (Positive Rate)
-    # 监控模型预测了多少个 1。如果太低，说明模型在躺平；如果太高，说明在乱猜。
-    # 正常的蛋白质通常有 10-50 个 GO Term，对于 One-hot 向量来说非常稀疏
-    avg_pred_count = preds.sum(axis=1).mean()
-    avg_true_count = y_true.sum(axis=1).mean()
-    
-    return {
-        'f1_sample': sample_f1,
-        'f1_macro': macro_f1,
-        'precision': precision,
-        'recall': recall,
-        'avg_pred_terms': avg_pred_count, # 预测平均词数
-        'avg_true_terms': avg_true_count  # 真实平均词数
-    }
+    for thresh in thresholds:
+        preds = (probs > thresh).float()
+        
+        # Sample-wise F1 Calculation on GPU
+        # TP: 预测为1 且 真实为1
+        tp = (preds * y_true_tensor).sum(dim=1)
+        # FP: 预测为1 且 真实为0
+        fp = (preds * (1 - y_true_tensor)).sum(dim=1)
+        # FN: 预测为0 且 真实为1
+        fn = ((1 - preds) * y_true_tensor).sum(dim=1)
+        
+        # F1 = 2TP / (2TP + FP + FN)
+        # 加上极小值防止除零
+        f1 = 2 * tp / (2 * tp + fp + fn + 1e-6)
+        avg_f1 = f1.mean().item()
+        
+        if avg_f1 > best_f1:
+            best_f1 = avg_f1
+            
+            # 只有最佳阈值才计算详情
+            precision = tp / (tp + fp + 1e-6)
+            recall = tp / (tp + fn + 1e-6)
+            
+            best_metrics = {
+                'f1': avg_f1,
+                'precision': precision.mean().item(),
+                'recall': recall.mean().item(),
+                'avg_pred': preds.sum(dim=1).mean().item(),
+                'avg_true': y_true_tensor.sum(dim=1).mean().item(),
+                'best_thresh': thresh
+            }
+            
+    return best_metrics
 
-# ================= 3. 数据加载与预处理 =================
-def load_data():
-    print(">>> Loading Data & Computing IC Weights...")
+# ================= 3. 数据加载 (GPU 直通) =================
+def load_data_to_gpu(device):
+    print(">>> Loading Data to GPU Memory...")
     with open(PATHS['embeddings'], 'rb') as f:
-        embeddings = pickle.load(f)
+        embeddings_dict = pickle.load(f)
     
     df = pd.read_csv(PATHS['train_terms'], sep='\t')
     
-    # 标签截断策略：覆盖 MAX_LABELS
     term_counts = df['term'].value_counts()
     selected_terms = term_counts.head(MAX_LABELS).index.tolist()
     term_to_idx = {term: i for i, term in enumerate(selected_terms)}
     num_classes = len(selected_terms)
     
-    # 计算 IC 权重 (Information Content)
-    # IC(t) = -log2(P(t))
-    total_annots = len(df)
+    # IC Weights
+    total = len(df)
     counts = term_counts.head(MAX_LABELS).values
-    probs = (counts + 1) / (total_annots + num_classes)
+    probs = (counts + 1) / (total + num_classes)
     ic_weights = -np.log2(probs)
-    ic_weights = ic_weights / ic_weights.mean() # 归一化
+    ic_weights = ic_weights / ic_weights.mean()
     
-    print(f"Target Labels: {num_classes}")
-    print(f"IC Weights stats: Min={ic_weights.min():.2f}, Max={ic_weights.max():.2f}, Mean={ic_weights.mean():.2f}")
-    
-    # 构建映射
-    labels_dict = {}
-    valid_proteins = set(embeddings.keys())
-    
-    # 优化 Groupby 速度
-    print("Mapping annotations...")
-    # 只保留有效数据
+    valid_proteins = set(embeddings_dict.keys())
     df = df[df['EntryID'].isin(valid_proteins) & df['term'].isin(set(selected_terms))]
+    
     temp_dict = df.groupby('EntryID')['term'].apply(list).to_dict()
+    all_pids = list(temp_dict.keys())
     
-    for pid, terms in tqdm(temp_dict.items()):
-        labels_dict[pid] = [term_to_idx[t] for t in terms]
+    # Stack to GPU Tensor
+    feature_list = []
+    label_list = []
+    for pid in tqdm(all_pids, desc="Preparing Tensors"):
+        feature_list.append(embeddings_dict[pid])
+        label_list.append([term_to_idx[t] for t in temp_dict[pid]])
         
-    return embeddings, labels_dict, list(labels_dict.keys()), num_classes, ic_weights
+    X_tensor = torch.stack(feature_list).to(device)
+    print(f"Data Loaded on GPU: {X_tensor.shape}")
+    
+    return X_tensor, label_list, num_classes, ic_weights
 
-# ================= 4. 主训练循环 (Pro版) =================
+# ================= 4. 主训练循环 =================
 def train():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device} (Batch Size: {BATCH_SIZE})")
+    device = torch.device('cuda')
+    print(f"🔥 HYPER Training Mode (Batch: {BATCH_SIZE})")
 
-    embeddings, labels_dict, all_pids, num_classes, ic_weights = load_data()
+    X_tensor, label_list, num_classes, ic_weights = load_data_to_gpu(device)
     
-    # 划分数据集
-    train_pids, val_pids = train_test_split(all_pids, test_size=0.1, random_state=42)
+    indices = np.arange(len(label_list))
+    train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
     
-    train_dataset = CachedEmbeddingDataset(train_pids, embeddings, labels_dict, num_classes)
-    val_dataset = CachedEmbeddingDataset(val_pids, embeddings, labels_dict, num_classes)
+    # Dataset
+    train_dataset = UltraFastDataset(X_tensor[train_idx], [label_list[i] for i in train_idx], num_classes)
+    val_dataset = UltraFastDataset(X_tensor[val_idx], [label_list[i] for i in val_idx], num_classes)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
+    # num_workers=0 避免多进程开销
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # 初始化
     model = ESM2Predictor(num_classes).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-    
-    # 学习率调度器: 当验证集 Loss 不再下降时，降低学习率
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
-    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
     scaler = GradScaler()
     criterion = ICWeightedBCELoss(ic_weights, device)
 
-    # 状态追踪
     best_val_f1 = 0.0
     patience_counter = 0
-    logs = []
-
-    print(f"\n🔥 Starting M2 Training (Optimized for L20 48GB)")
-    print(f"{'Epoch':<6} | {'Loss':<8} | {'Val F1':<8} | {'Pre/Rec':<14} | {'Active Terms (Pred/True)':<25}")
+    
+    print("\n🚀 Training Start")
+    print(f"{'Epoch':<6} | {'Loss':<8} | {'Val F1':<8} | {'Pre/Rec':<12} | {'Pred/True':<12} | {'Best Thresh'}")
     print("-" * 80)
 
     for epoch in range(EPOCHS):
@@ -190,8 +188,9 @@ def train():
         model.train()
         train_loss = 0
         
-        for batch_emb, batch_labels in tqdm(train_loader, desc=f"Ep {epoch+1} Train", leave=False):
-            batch_emb, batch_labels = batch_emb.to(device, non_blocking=True), batch_labels.to(device, non_blocking=True)
+        # 使用 leave=False 让进度条跑完就消失，不刷屏
+        for batch_emb, batch_labels in tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False):
+            batch_labels = batch_labels.to(device) # Labels 从 CPU -> GPU
             
             optimizer.zero_grad()
             with autocast():
@@ -205,63 +204,43 @@ def train():
             
         avg_train_loss = train_loss / len(train_loader)
 
-        # --- Validation (Full Metrics) ---
+        # --- Validation (全 GPU) ---
         model.eval()
-        val_preds = []
-        val_targets = []
+        # 预分配 GPU 空间存储所有验证结果，避免 list append 的开销
+        val_logits_list = []
+        val_targets_list = []
         
         with torch.no_grad():
             for batch_emb, batch_labels in val_loader:
-                batch_emb = batch_emb.to(device, non_blocking=True)
+                batch_labels = batch_labels.to(device)
                 outputs = model(batch_emb)
-                # 收集 Logits 和 Labels 到 CPU 进行一次性计算
-                val_preds.append(outputs.cpu().numpy())
-                val_targets.append(batch_labels.numpy())
+                # 保持在 GPU 上！不要 .cpu()
+                val_logits_list.append(outputs) 
+                val_targets_list.append(batch_labels)
         
-        # 拼接大矩阵
-        val_preds = np.vstack(val_preds)
-        val_targets = np.vstack(val_targets)
+        # 拼接大 Tensor (仍在 GPU)
+        val_logits = torch.cat(val_logits_list)
+        val_targets = torch.cat(val_targets_list)
         
-        # 计算详细指标
-        metrics = calculate_metrics(val_targets, val_preds, threshold=0.3)
+        # 在 GPU 上计算指标
+        metrics = calculate_metrics_gpu(val_targets, val_logits)
         
-        # 打印监控面板
-        print(f"{epoch+1:<6} | {avg_train_loss:.4f}   | {metrics['f1_sample']:.4f}   | "
+        print(f"{epoch+1:<6} | {avg_train_loss:.4f}   | {metrics['f1']:.4f}   | "
               f"{metrics['precision']:.2f}/{metrics['recall']:.2f}   | "
-              f"{metrics['avg_pred_terms']:.1f} / {metrics['avg_true_terms']:.1f}")
-
-        # --- Scheduler & Checkpoint ---
-        # 根据 F1 调整学习率
-        scheduler.step(metrics['f1_sample'])
+              f"{metrics['avg_pred']:.1f}/{metrics['avg_true']:.1f}   | {metrics['best_thresh']:.2f}")
         
-        # 保存最佳模型
-        if metrics['f1_sample'] > best_val_f1:
-            best_val_f1 = metrics['f1_sample']
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'f1': best_val_f1,
-            }, PATHS['model_save'])
-            print(f"    >>> ⭐ New Best Model! Saved.")
+        # Scheduler & Save
+        scheduler.step(metrics['f1'])
+        
+        if metrics['f1'] > best_val_f1:
+            best_val_f1 = metrics['f1']
+            torch.save(model.state_dict(), PATHS['model_save'])
             patience_counter = 0
         else:
             patience_counter += 1
-            
-        # 记录日志
-        logs.append({
-            'epoch': epoch + 1,
-            'train_loss': avg_train_loss,
-            **metrics
-        })
-        pd.DataFrame(logs).to_csv(PATHS['log_file'], index=False)
-        
-        # --- Early Stopping ---
-        if patience_counter >= PATIENCE:
-            print(f"\n🛑 Early stopping triggered at epoch {epoch+1}. Best F1: {best_val_f1:.4f}")
-            break
-
-    print("\n✅ Training Complete.")
+            if patience_counter >= PATIENCE:
+                print(f"🛑 Early Stopping. Best F1: {best_val_f1:.4f}")
+                break
 
 if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
