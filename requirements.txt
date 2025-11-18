@@ -1,0 +1,18 @@
+# CAFA6 environment lock (tested on 2025-11-17)
+# Use with: pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Core
+torch==2.5.1
+transformers==4.57.1
+huggingface_hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.6.2
+accelerate==1.11.0
+sentencepiece==0.2.1
+
+# Utils
+numpy==2.2.6
+tqdm==4.67.1
+PyYAML==6.0.3
+requests>=2.32.0
+regex>=2025.11.3
