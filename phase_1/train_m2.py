@@ -21,6 +21,7 @@ PATHS = {
     'embeddings': './cache/esm2-650M_embeddings.pkl',
     'train_terms': 'data/Train/train_terms.tsv',
     'model_save': './models/m2_esm2_hyper.pth',
+    'vocab_save': './models/vocab.pkl',          # <--- 新增：保存词表路径
     'log_file': './models/training_log.csv'
 }
 os.makedirs('./models', exist_ok=True)
@@ -66,43 +67,28 @@ class UltraFastDataset(Dataset):
             label_vec[label_indices] = 1.0
         return emb, label_vec
 
-# ================= 2. [关键优化] GPU 加速指标计算 =================
+# ================= 2. GPU 加速指标计算 =================
 def calculate_metrics_gpu(y_true_tensor, y_logits_tensor):
-    """
-    完全在 GPU 上计算 F1，消除 CPU 瓶颈。
-    同时扫描最佳阈值，解决"预测数量少"的问题。
-    """
     probs = torch.sigmoid(y_logits_tensor)
-    
     best_f1 = 0.0
     best_metrics = {}
     
-    # 扫描阈值 (模拟 CAFA 官方逻辑)
+    # 模拟 CAFA 阈值扫描
     thresholds = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
     
     for thresh in thresholds:
         preds = (probs > thresh).float()
-        
-        # Sample-wise F1 Calculation on GPU
-        # TP: 预测为1 且 真实为1
         tp = (preds * y_true_tensor).sum(dim=1)
-        # FP: 预测为1 且 真实为0
         fp = (preds * (1 - y_true_tensor)).sum(dim=1)
-        # FN: 预测为0 且 真实为1
         fn = ((1 - preds) * y_true_tensor).sum(dim=1)
         
-        # F1 = 2TP / (2TP + FP + FN)
-        # 加上极小值防止除零
         f1 = 2 * tp / (2 * tp + fp + fn + 1e-6)
         avg_f1 = f1.mean().item()
         
         if avg_f1 > best_f1:
             best_f1 = avg_f1
-            
-            # 只有最佳阈值才计算详情
             precision = tp / (tp + fp + 1e-6)
             recall = tp / (tp + fn + 1e-6)
-            
             best_metrics = {
                 'f1': avg_f1,
                 'precision': precision.mean().item(),
@@ -111,10 +97,9 @@ def calculate_metrics_gpu(y_true_tensor, y_logits_tensor):
                 'avg_true': y_true_tensor.sum(dim=1).mean().item(),
                 'best_thresh': thresh
             }
-            
     return best_metrics
 
-# ================= 3. 数据加载 (GPU 直通) =================
+# ================= 3. 数据加载 (关键修正：保存 Vocab) =================
 def load_data_to_gpu(device):
     print(">>> Loading Data to GPU Memory...")
     with open(PATHS['embeddings'], 'rb') as f:
@@ -122,25 +107,34 @@ def load_data_to_gpu(device):
     
     df = pd.read_csv(PATHS['train_terms'], sep='\t')
     
+    # 计算 Top Terms
     term_counts = df['term'].value_counts()
     selected_terms = term_counts.head(MAX_LABELS).index.tolist()
+    
+    # --- 🔥 关键修正：保存这个列表供推理使用 ---
+    print(f">>> Saving vocabulary ({len(selected_terms)} terms) to {PATHS['vocab_save']}...")
+    with open(PATHS['vocab_save'], 'wb') as f:
+        pickle.dump(selected_terms, f)
+    # ---------------------------------------
+
     term_to_idx = {term: i for i, term in enumerate(selected_terms)}
     num_classes = len(selected_terms)
     
-    # IC Weights
+    # 计算 IC 权重
     total = len(df)
     counts = term_counts.head(MAX_LABELS).values
     probs = (counts + 1) / (total + num_classes)
     ic_weights = -np.log2(probs)
     ic_weights = ic_weights / ic_weights.mean()
     
+    # 过滤有效数据
     valid_proteins = set(embeddings_dict.keys())
     df = df[df['EntryID'].isin(valid_proteins) & df['term'].isin(set(selected_terms))]
     
     temp_dict = df.groupby('EntryID')['term'].apply(list).to_dict()
     all_pids = list(temp_dict.keys())
     
-    # Stack to GPU Tensor
+    # 构建 Tensor
     feature_list = []
     label_list = []
     for pid in tqdm(all_pids, desc="Preparing Tensors"):
@@ -162,11 +156,9 @@ def train():
     indices = np.arange(len(label_list))
     train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
     
-    # Dataset
     train_dataset = UltraFastDataset(X_tensor[train_idx], [label_list[i] for i in train_idx], num_classes)
     val_dataset = UltraFastDataset(X_tensor[val_idx], [label_list[i] for i in val_idx], num_classes)
     
-    # num_workers=0 避免多进程开销
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -184,19 +176,14 @@ def train():
     print("-" * 80)
 
     for epoch in range(EPOCHS):
-        # --- Train ---
         model.train()
         train_loss = 0
-        
-        # 使用 leave=False 让进度条跑完就消失，不刷屏
         for batch_emb, batch_labels in tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False):
-            batch_labels = batch_labels.to(device) # Labels 从 CPU -> GPU
-            
+            batch_labels = batch_labels.to(device)
             optimizer.zero_grad()
             with autocast():
                 outputs = model(batch_emb)
                 loss = criterion(outputs, batch_labels)
-            
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -204,34 +191,23 @@ def train():
             
         avg_train_loss = train_loss / len(train_loader)
 
-        # --- Validation (全 GPU) ---
         model.eval()
-        # 预分配 GPU 空间存储所有验证结果，避免 list append 的开销
         val_logits_list = []
         val_targets_list = []
-        
         with torch.no_grad():
             for batch_emb, batch_labels in val_loader:
                 batch_labels = batch_labels.to(device)
                 outputs = model(batch_emb)
-                # 保持在 GPU 上！不要 .cpu()
                 val_logits_list.append(outputs) 
                 val_targets_list.append(batch_labels)
         
-        # 拼接大 Tensor (仍在 GPU)
-        val_logits = torch.cat(val_logits_list)
-        val_targets = torch.cat(val_targets_list)
-        
-        # 在 GPU 上计算指标
-        metrics = calculate_metrics_gpu(val_targets, val_logits)
+        metrics = calculate_metrics_gpu(torch.cat(val_targets_list), torch.cat(val_logits_list))
         
         print(f"{epoch+1:<6} | {avg_train_loss:.4f}   | {metrics['f1']:.4f}   | "
               f"{metrics['precision']:.2f}/{metrics['recall']:.2f}   | "
               f"{metrics['avg_pred']:.1f}/{metrics['avg_true']:.1f}   | {metrics['best_thresh']:.2f}")
         
-        # Scheduler & Save
         scheduler.step(metrics['f1'])
-        
         if metrics['f1'] > best_val_f1:
             best_val_f1 = metrics['f1']
             torch.save(model.state_dict(), PATHS['model_save'])
@@ -243,5 +219,4 @@ def train():
                 break
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     train()
