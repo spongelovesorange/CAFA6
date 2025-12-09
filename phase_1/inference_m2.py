@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-CAFA6 - F1 Optimized Ensemble Inference
-目标：最大化F-max分数（基于CAFA历史最佳实践）
+CAFA6 推理脚本 - 使用Global F-max最佳阈值
 
-关键策略：
-1. Threshold=0.10（实验证明的最佳点）
-2. 每蛋白保留150-250个预测（Precision vs Recall最佳平衡）
-3. 更激进的自适应阈值
+关键：
+- 训练时Global F-max最佳阈值约0.35
+- 每蛋白预测数约5-6个
+- 不要用低阈值，会产生大量假阳性
 """
 
 import os
@@ -17,40 +16,37 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-# ================= 🎯 F1优化配置 =================
+# ================= 配置 =================
 MODEL_PATHS = [
+    './models/m2_esm2_fold0_fmax.pth',
+    './models/m2_esm2_fold1_fmax.pth',
+    './models/m2_esm2_fold2_fmax.pth'
+]
+
+# 备选路径（旧模型）
+OLD_MODEL_PATHS = [
     './models/m2_esm2_fold0_ultimate.pth',
     './models/m2_esm2_fold1_ultimate.pth',
     './models/m2_esm2_fold2_ultimate.pth'
 ]
+
 EMBEDDING_PATH = './cache/esm2-650M_embeddings.pkl'
 VOCAB_PATH = './models/vocab.pkl'
 TEST_FASTA_PATH = 'data/Test/testsuperset.fasta'
 OUTPUT_FILE = 'submission.tsv'
 
-# 设备配置
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-BATCH_SIZE = 4096 if DEVICE == 'cuda' else 512
-
-# 🎯 F1优化参数（基于CAFA历史最佳实践）
-GLOBAL_MIN_THRESHOLD = 0.10      # ← 从0.05提升到0.10（历史最佳点）
-MAX_PREDS_PER_PROTEIN = 200      # ← 从500降到200（F1最优）
-TOP_K_CUTOFF = 350               # ← 从800降到350（控制FP）
-
-# 更激进的自适应阈值
-ADAPTIVE_THRESHOLDS = {
-    'high_confidence': 0.08,     # max_score > 0.7
-    'medium_confidence': 0.12,   # max_score > 0.5
-    'low_confidence': 0.18       # max_score < 0.5（非常保守）
-}
-
-# 额外的质量过滤
-MIN_PRED_PER_PROTEIN = 5         # 至少保留5个预测（避免过度过滤）
-CONFIDENCE_BOOST = True          # 对高分预测放宽限制
+BATCH_SIZE = 4096
 
 
+DEFAULT_THRESHOLD = 0.02         
+MAX_PREDS_PER_PROTEIN = 150        
+MIN_PREDS_PER_PROTEIN = 30        
+
+
+# ================= 模型定义 =================
 class ESM2PredictorUltimate(nn.Module):
-    """和训练时一致的模型架构"""
+    """带Temperature的模型"""
     def __init__(self, n_labels, esm_embedding_dim=1280):
         super().__init__()
         
@@ -78,106 +74,23 @@ class ESM2PredictorUltimate(nn.Module):
     def forward(self, x):
         logits = self.head(x)
         temp = self.temperature.clamp(min=0.2, max=1.0)
-        scaled_logits = logits / temp
-        return scaled_logits
-    
-    def get_temperature(self):
-        return self.temperature.clamp(min=0.2, max=1.0).item()
+        return logits / temp
 
 
 def parse_protein_id(header):
-    """从FASTA header提取protein ID"""
     clean = header.strip()
     if clean.startswith('>'):
         clean = clean[1:]
     return clean.split()[0]
 
 
-def get_adaptive_threshold(max_score):
-    """
-    根据最高分数动态调整阈值
-    高置信度蛋白可以包含更多预测
-    """
-    if max_score > 0.7:
-        return ADAPTIVE_THRESHOLDS['high_confidence']
-    elif max_score > 0.5:
-        return ADAPTIVE_THRESHOLDS['medium_confidence']
-    else:
-        return ADAPTIVE_THRESHOLDS['low_confidence']
-
-
-def filter_predictions_f1_optimized(scores, idx_to_term):
-    """
-    F1优化的过滤策略
-    
-    策略：
-    1. 自适应阈值（根据置信度）
-    2. Top-K截断（控制FP）
-    3. 保证最小预测数（保证Recall）
-    4. 对高分预测放宽限制（Confidence boost）
-    """
-    max_score = scores.max()
-    
-    # Step 1: 确定自适应阈值
-    adaptive_threshold = get_adaptive_threshold(max_score)
-    threshold = max(GLOBAL_MIN_THRESHOLD, adaptive_threshold)
-    
-    # Step 2: 基础阈值过滤
-    indices = np.where(scores >= threshold)[0]
-    
-    # Step 3: Confidence Boost（对于高分蛋白，额外保留一些次高分预测）
-    if CONFIDENCE_BOOST and max_score > 0.7 and len(indices) < 50:
-        # 如果是高置信度但预测很少，放宽到0.05
-        relaxed_threshold = max(0.05, threshold * 0.5)
-        relaxed_indices = np.where(scores >= relaxed_threshold)[0]
-        
-        # 保留Top-100
-        if len(relaxed_indices) > 100:
-            relaxed_scores = scores[relaxed_indices]
-            sorted_pos = np.argsort(relaxed_scores)[::-1][:100]
-            indices = relaxed_indices[sorted_pos]
-        else:
-            indices = relaxed_indices
-    
-    # Step 4: Top-K截断（防止过多预测）
-    if len(indices) > TOP_K_CUTOFF:
-        candidate_scores = scores[indices]
-        sorted_positions = np.argsort(candidate_scores)[::-1]
-        indices = indices[sorted_positions[:TOP_K_CUTOFF]]
-    
-    # Step 5: 最终数量限制
-    if len(indices) > MAX_PREDS_PER_PROTEIN:
-        candidate_scores = scores[indices]
-        sorted_positions = np.argsort(candidate_scores)[::-1]
-        indices = indices[sorted_positions[:MAX_PREDS_PER_PROTEIN]]
-    
-    # Step 6: 保证最小预测数（避免过度过滤影响Recall）
-    if len(indices) < MIN_PRED_PER_PROTEIN:
-        # 至少保留Top-5
-        all_indices = np.argsort(scores)[::-1][:MIN_PRED_PER_PROTEIN]
-        indices = all_indices
-        threshold = scores[indices[-1]]  # 更新实际使用的阈值
-    
-    # 按分数排序
-    indices = indices[np.argsort(scores[indices])[::-1]]
-    
-    return indices, threshold
-
-
 def find_in_cache(pid, embeddings_dict):
-    """尝试多种key格式匹配cache"""
-    possible_keys = [
-        pid,
-        f">{pid}",
-        f"{pid} 9615",
-        f">{pid} 9615"
-    ]
+    possible_keys = [pid, f">{pid}", f"{pid} 9615", f">{pid} 9615"]
     
     for key in possible_keys:
         if key in embeddings_dict:
             return key
     
-    # 模糊匹配
     for cache_key in embeddings_dict.keys():
         if isinstance(cache_key, str) and pid in cache_key:
             return cache_key
@@ -185,132 +98,142 @@ def find_in_cache(pid, embeddings_dict):
     return None
 
 
+def filter_predictions(scores, threshold, max_preds, min_preds):
+    """
+    严格的 Top-K 过滤，控制文件体积
+    """
+    # 1. 先拿到所有大于阈值的索引
+    indices = np.where(scores >= threshold)[0]
+    
+    # 2. 按照分数从高到低排序
+    sorted_indices_raw = indices[np.argsort(scores[indices])[::-1]]
+    
+    # 3. 逻辑分支：
+    if len(sorted_indices_raw) > max_preds:
+        # 情况A: 预测太多 -> 只要前 MAX 个 (比如前300个)
+        final_indices = sorted_indices_raw[:max_preds]
+        
+    elif len(sorted_indices_raw) < min_preds:
+        # 情况B: 预测太少 (甚至可能是0) -> 强行去原始分数里找 Top-MIN 个
+        # 注意：这里要回到原始 scores 数组去抓，不管阈值
+        top_k_all = np.argsort(scores)[::-1][:min_preds]
+        final_indices = top_k_all
+        
+    else:
+        # 情况C: 数量适中 -> 保持原样
+        final_indices = sorted_indices_raw
+        
+    return final_indices
+
 def main():
     print("\n" + "="*80)
-    print("🎯 CAFA6 - F1 Optimized Ensemble Inference")
+    print("🎯 CAFA6 推理 - 使用Global F-max最佳阈值")
     print("="*80)
     
-    # 设备信息
-    print(f"\n🖥️  Device: {DEVICE.upper()}")
-    if DEVICE == 'cpu':
-        print(f"   ⚠️  Using CPU (slower)")
+    print(f"\n🖥️  Device: {DEVICE}")
+    print(f"📋 Configuration:")
+    print(f"   Default threshold: {DEFAULT_THRESHOLD}")
+    print(f"   Max preds/protein: {MAX_PREDS_PER_PROTEIN}")
+    print(f"   Min preds/protein: {MIN_PREDS_PER_PROTEIN}")
     
-    print("\n🎯 F1 Optimization Strategy:")
-    print(f"   Target metric:            F-max (CAFA)")
-    print(f"   Global threshold:         {GLOBAL_MIN_THRESHOLD}")
-    print(f"   Max preds/protein:        {MAX_PREDS_PER_PROTEIN}")
-    print(f"   Min preds/protein:        {MIN_PRED_PER_PROTEIN}")
-    print(f"   Top-K cutoff:             {TOP_K_CUTOFF}")
-    print(f"   Confidence boost:         {CONFIDENCE_BOOST}")
-    print(f"   Adaptive thresholds:      {ADAPTIVE_THRESHOLDS}")
-    print(f"   Expected F-max:           0.34-0.38")
-    print(f"   Target file size:         < 400 MB")
-    
-    # ==================== 1. 检查文件 ====================
+    # ==================== 检查文件 ====================
     print("\n>>> Checking files...")
     
-    # 检查模型
     available_models = []
-    for i, path in enumerate(MODEL_PATHS):
-        if os.path.exists(path):
-            print(f"  ✅ Fold {i}: {path}")
-            available_models.append(path)
-        else:
-            print(f"  ⚠️  Fold {i}: {path} NOT FOUND")
     
-    if len(available_models) == 0:
+    # 先找新模型
+    for path in MODEL_PATHS:
+        if os.path.exists(path):
+            available_models.append(path)
+            print(f"  ✅ {path}")
+    
+    # 如果没有，找旧模型
+    if not available_models:
+        print("  New models not found, trying old paths...")
+        for path in OLD_MODEL_PATHS:
+            if os.path.exists(path):
+                available_models.append(path)
+                print(f"  ✅ {path}")
+    
+    if not available_models:
         print("❌ No models found!")
         return
     
-    MODEL_PATHS[:] = available_models
-    print(f"  Using {len(MODEL_PATHS)} model(s) for ensemble")
-    
-    # 检查其他文件
     for path in [EMBEDDING_PATH, VOCAB_PATH, TEST_FASTA_PATH]:
         if not os.path.exists(path):
-            print(f"❌ File not found: {path}")
+            print(f"❌ Not found: {path}")
             return
     
-    # ==================== 2. 加载词表 ====================
-    print(f"\n>>> Loading Vocabulary...")
+    # ==================== 加载数据 ====================
+    print(f"\n>>> Loading vocabulary...")
     with open(VOCAB_PATH, 'rb') as f:
         selected_terms = pickle.load(f)
-    
     idx_to_term = {i: t for i, t in enumerate(selected_terms)}
     num_labels = len(selected_terms)
-    print(f"✅ Vocab: {num_labels:,} GO terms")
+    print(f"✅ {num_labels:,} GO terms")
     
-    # ==================== 3. 加载Embeddings ====================
-    print(f"\n>>> Loading ESM2 Embeddings Cache...")
+    print(f"\n>>> Loading embeddings...")
     with open(EMBEDDING_PATH, 'rb') as f:
         embeddings_dict = pickle.load(f)
-    print(f"✅ Cache: {len(embeddings_dict):,} proteins")
+    print(f"✅ {len(embeddings_dict):,} proteins in cache")
     
-    # ==================== 4. 匹配测试集 ====================
-    print(f"\n>>> Matching Test Sequences...")
-    
+    print(f"\n>>> Matching test proteins...")
     test_proteins = []
     X_list = []
-    missing_count = 0
     
     with open(TEST_FASTA_PATH, 'r') as f:
-        for line in tqdm(f, desc="Reading FASTA"):
+        for line in tqdm(f, desc="Reading"):
             if line.startswith('>'):
                 pid = parse_protein_id(line)
                 cache_key = find_in_cache(pid, embeddings_dict)
-                
                 if cache_key:
                     X_list.append(embeddings_dict[cache_key])
                     test_proteins.append(pid)
-                else:
-                    missing_count += 1
     
-    print(f"✅ Matched: {len(test_proteins):,} proteins")
-    if missing_count > 0:
-        match_rate = len(test_proteins) / (len(test_proteins) + missing_count) * 100
-        print(f"⚠️  Missing: {missing_count} proteins ({100-match_rate:.1f}% missing)")
-        if match_rate < 90:
-            print(f"   ⚠️  Low match rate! Check cache generation")
+    print(f"✅ Matched {len(test_proteins):,} proteins")
     
-    if len(X_list) == 0:
-        print("❌ No proteins matched!")
-        return
-    
-    # Stack到设备
-    print(f"\n>>> Preparing tensors...")
     X_test = torch.tensor(np.stack(X_list)).float().to(DEVICE)
-    print(f"✅ Tensor shape: {X_test.shape}")
     
-    # ==================== 5. 加载模型 ====================
-    print(f"\n>>> Loading {len(MODEL_PATHS)} Model(s)...")
+    # ==================== 加载模型 ====================
+    print(f"\n>>> Loading {len(available_models)} model(s)...")
     
     models = []
+    thresholds_global = []
     
-    for fold_idx, model_path in enumerate(MODEL_PATHS):
-        print(f"  Fold {fold_idx}...", end=" ")
+    for model_path in available_models:
+        checkpoint = torch.load(model_path, map_location=DEVICE)
         
         model = ESM2PredictorUltimate(num_labels).to(DEVICE)
         
-        if DEVICE == 'cpu':
-            checkpoint = torch.load(model_path, map_location='cpu')
-        else:
-            checkpoint = torch.load(model_path)
-        
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
-            f1 = checkpoint.get('best_f1', 'N/A')
-            print(f"✅ (F1: {f1})")
+            
+            # 🔥 读取Global最佳阈值
+            thresh_g = checkpoint.get('best_threshold_global', None)
+            thresh_s = checkpoint.get('best_threshold_sample', checkpoint.get('best_threshold', None))
+            f1_g = checkpoint.get('best_f1_global', None)
+            f1_s = checkpoint.get('best_f1_sample', checkpoint.get('best_f1', None))
+            
+            print(f"  {model_path}:")
+            print(f"    F1(G)={f1_g}, ThG={thresh_g}")
+            print(f"    F1(S)={f1_s}, ThS={thresh_s}")
+            
+            if thresh_g:
+                thresholds_global.append(thresh_g)
+            elif thresh_s:
+                thresholds_global.append(thresh_s)
         else:
             model.load_state_dict(checkpoint)
-            print("✅")
+            print(f"  {model_path}: loaded (no metadata)")
         
         model.eval()
         models.append(model)
+
+    THRESHOLD = DEFAULT_THRESHOLD  # 即 0.001
+    print(f"\n🎯 [FIXED] Forcing inference threshold: {THRESHOLD:.3f} (ignoring training threshold)")
     
-    print(f"✅ Loaded {len(models)} model(s)")
-    
-    # ==================== 6. Ensemble推理 ====================
-    print(f"\n>>> Running Ensemble Inference...")
+    # ==================== 推理 ====================
+    print(f"\n>>> Running inference...")
     
     all_probs = []
     
@@ -318,7 +241,6 @@ def main():
         for i in tqdm(range(0, len(X_test), BATCH_SIZE), desc="Inference"):
             batch = X_test[i:i+BATCH_SIZE]
             
-            # 平均所有fold的logits
             logits_sum = None
             for model in models:
                 logits = model(batch)
@@ -332,147 +254,71 @@ def main():
             all_probs.append(probs)
     
     all_probs = np.vstack(all_probs)
-    print(f"✅ Inference complete: {all_probs.shape}")
     
-    # 概率分布分析
+    # 概率分布
     print(f"\n📊 Probability Distribution:")
-    print(f"   Mean:    {all_probs.mean():.6f}")
-    print(f"   Median:  {np.median(all_probs):.6f}")
-    print(f"   Std:     {all_probs.std():.6f}")
-    print(f"   Max:     {all_probs.max():.6f}")
-    print(f"   >0.05:   {(all_probs > 0.05).mean():.4%}")
-    print(f"   >0.10:   {(all_probs > 0.10).mean():.4%}  ← Target threshold")
-    print(f"   >0.20:   {(all_probs > 0.20).mean():.4%}")
-    print(f"   >0.50:   {(all_probs > 0.50).mean():.6%}")
+    print(f"   Mean: {all_probs.mean():.4f}, Max: {all_probs.max():.4f}")
+    print(f"   >0.1: {(all_probs > 0.1).mean():.2%}")
+    print(f"   >0.3: {(all_probs > 0.3).mean():.4%}")
+    print(f"   >0.5: {(all_probs > 0.5).mean():.6%}")
     
-    # ==================== 7. F1优化过滤 + 写文件 ====================
-    print(f"\n>>> Writing Submission with F1-Optimized Filtering...")
+    # ==================== 写文件 ====================
+    print(f"\n>>> Writing submission (threshold={THRESHOLD:.3f})...")
     
-    total_predictions = 0
-    threshold_stats = {'high': 0, 'medium': 0, 'low': 0, 'boosted': 0}
+    total_preds = 0
     pred_counts = []
     
     with open(OUTPUT_FILE, 'w') as f:
         for i, pid in enumerate(tqdm(test_proteins, desc="Writing")):
             scores = all_probs[i]
             
-            # F1优化过滤
-            indices, used_threshold = filter_predictions_f1_optimized(scores, idx_to_term)
+            indices = filter_predictions(
+                scores, 
+                threshold=THRESHOLD,
+                max_preds=MAX_PREDS_PER_PROTEIN,
+                min_preds=MIN_PREDS_PER_PROTEIN
+            )
             
-            # 统计
             pred_counts.append(len(indices))
             
-            max_score = scores.max()
-            if max_score > 0.7:
-                threshold_stats['high'] += 1
-            elif max_score > 0.5:
-                threshold_stats['medium'] += 1
-            elif len(indices) > MAX_PREDS_PER_PROTEIN * 0.8:
-                threshold_stats['boosted'] += 1
-            else:
-                threshold_stats['low'] += 1
-            
-            # 写入
             for idx in indices:
-                score = scores[idx]
-                f.write(f"{pid}\t{idx_to_term[idx]}\t{score:.3f}\n")
-                total_predictions += 1
+                f.write(f"{pid}\t{idx_to_term[idx]}\t{scores[idx]:.3f}\n")
+                total_preds += 1
     
-    print(f"✅ Submission created: {OUTPUT_FILE}")
-    print(f"   Total predictions: {total_predictions:,}")
+    print(f"✅ Created: {OUTPUT_FILE}")
     
-    # 阈值使用统计
-    print(f"\n📊 Filtering Statistics:")
-    total_prots = len(test_proteins)
-    print(f"   High conf (>0.7):     {threshold_stats['high']:,} ({threshold_stats['high']/total_prots:.1%})")
-    print(f"   Med conf (>0.5):      {threshold_stats['medium']:,} ({threshold_stats['medium']/total_prots:.1%})")
-    print(f"   Low conf (<0.5):      {threshold_stats['low']:,} ({threshold_stats['low']/total_prots:.1%})")
-    print(f"   Confidence boosted:   {threshold_stats['boosted']:,} ({threshold_stats['boosted']/total_prots:.1%})")
-    
-    # ==================== 8. 验证 ====================
+    # ==================== 统计 ====================
     print("\n" + "="*80)
-    print("📊 FINAL VALIDATION")
+    print("📊 SUBMISSION STATISTICS")
     print("="*80)
     
-    df_check = pd.read_csv(OUTPUT_FILE, sep='\t', names=['id', 'term', 'score'])
+    df = pd.read_csv(OUTPUT_FILE, sep='\t', names=['id', 'term', 'score'])
+    file_size = os.path.getsize(OUTPUT_FILE) / (1024*1024)
     
-    file_size_mb = os.path.getsize(OUTPUT_FILE) / (1024*1024)
+    print(f"\n📈 Summary:")
+    print(f"   Predictions: {len(df):,}")
+    print(f"   Proteins:    {df['id'].nunique():,}")
+    print(f"   File size:   {file_size:.1f} MB")
     
-    print(f"\n📈 File Statistics:")
-    print(f"   Total predictions:     {len(df_check):,}")
-    print(f"   Unique proteins:       {df_check['id'].nunique():,}")
-    print(f"   Unique GO terms:       {df_check['term'].nunique():,}")
-    print(f"   Avg preds/protein:     {len(df_check) / df_check['id'].nunique():.1f}")
-    print(f"   Score range:           [{df_check['score'].min():.3f}, {df_check['score'].max():.3f}]")
-    print(f"   📁 File size:          {file_size_mb:.1f} MB")
+    counts = df.groupby('id').size()
+    print(f"\n📊 Predictions per protein:")
+    print(f"   Min={counts.min()}, Median={counts.median():.0f}, "
+          f"Mean={counts.mean():.1f}, Max={counts.max()}")
     
-    # 文件大小判断
-    if file_size_mb > 500:
-        print(f"   ❌ Still too large!")
-    elif file_size_mb > 300:
-        print(f"   ⚠️  Acceptable (but could be smaller)")
-    else:
-        print(f"   ✅ Good size!")
+    print(f"\n📊 Score distribution:")
+    print(f"   Min={df['score'].min():.3f}, Median={df['score'].median():.3f}, "
+          f"Max={df['score'].max():.3f}")
     
-    # 预测数分布
-    counts = df_check.groupby('id').size()
-    print(f"\n📊 Predictions per Protein:")
-    print(f"   Min:     {counts.min()}")
-    print(f"   10%:     {counts.quantile(0.10):.0f}")
-    print(f"   25%:     {counts.quantile(0.25):.0f}")
-    print(f"   Median:  {counts.median():.0f}")
-    print(f"   75%:     {counts.quantile(0.75):.0f}")
-    print(f"   90%:     {counts.quantile(0.90):.0f}")
-    print(f"   Max:     {counts.max()}")
-    print(f"   Mean:    {counts.mean():.1f}")
-    
-    # 合规性
-    print(f"\n✅ Compliance Checks:")
-    if counts.max() <= 1500:
-        print(f"   ✅ Max: {counts.max()} ≤ 1500")
-    else:
-        print(f"   ❌ {(counts > 1500).sum()} proteins > 1500!")
-    
-    if df_check['score'].min() > 0:
-        print(f"   ✅ All scores > 0")
-    
-    coverage = df_check['id'].nunique() / len(test_proteins) * 100
-    print(f"   ✅ Coverage: {coverage:.1f}%")
-    
-    # F1预测
-    avg_preds = counts.mean()
-    score_median = df_check['score'].median()
-    
+    # 预估性能
     print(f"\n🎯 Expected Performance:")
-    if avg_preds < 100:
-        print(f"   Avg preds: {avg_preds:.1f} (conservative)")
-    elif avg_preds < 200:
-        print(f"   Avg preds: {avg_preds:.1f} (balanced) ✅")
-    else:
-        print(f"   Avg preds: {avg_preds:.1f} (aggressive)")
-    
-    if score_median > 0.15:
-        print(f"   Score median: {score_median:.3f} (high precision)")
-        print(f"   Expected F-max: 0.36-0.40 ⭐")
-    elif score_median > 0.10:
-        print(f"   Score median: {score_median:.3f} (balanced)")
-        print(f"   Expected F-max: 0.34-0.38 ✅")
-    else:
-        print(f"   Score median: {score_median:.3f} (high recall)")
-        print(f"   Expected F-max: 0.30-0.34")
+    print(f"   Training F1(G): ~0.21")
+    print(f"   With threshold {THRESHOLD:.2f} and avg {counts.mean():.1f} preds/protein")
+    print(f"   Expected Kaggle F-max: 0.18-0.25")
+    print(f"   After GO propagation: 0.22-0.30")
     
     print("\n" + "="*80)
-    print("✅ F1-OPTIMIZED INFERENCE COMPLETE!")
-    print("="*80)
-    print("\n📝 Next Steps:")
-    if file_size_mb < 400:
-        print("  1. Run GO propagation: python propagate.py")
-        print("  2. Submit: submission_propagated.tsv")
-        print("  3. Expected Kaggle LB: 0.34-0.38")
-    else:
-        print("  ⚠️  Consider more aggressive settings:")
-        print("     GLOBAL_MIN_THRESHOLD = 0.12")
-        print("     MAX_PREDS_PER_PROTEIN = 150")
+    print("✅ DONE!")
+    print(f"   Next: python propagation_fixed.py")
     print("="*80 + "\n")
 
 
