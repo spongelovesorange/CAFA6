@@ -4,3 +4,5 @@ data/
 folds/
 __MACOSX/
 results/
+submission.tsv
+submission_propagated.tsv.gz
